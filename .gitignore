@@ -1,0 +1,12 @@
+artifacts/
+
+Manifest.toml
+scripts/Manifest.toml
+
+*.png
+*.csv
+*.arr
+*.gif
+*.h5
+
+.vscode/
