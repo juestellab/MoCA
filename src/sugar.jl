@@ -1,33 +1,48 @@
 """
     sampler_from_weight_array(weights::Array{T, N}, distances::NTuple{N, T}) where {T, N}
-Instantiate a `DirectSampler` object that samples position coordinates according to `weights`.
-The argument `distances` is used to transform the index of an array-entry to a coordinate.
+Position sampler drawing cells of `weights` in proportion to their entry, then a
+uniform point inside the drawn cell. `distances` is the cell edge length along
+each axis; coordinates are centred on the array, i.e. axis `i` spans
+`[-size(weights, i) * distances[i] / 2, +size(weights, i) * distances[i] / 2]`.
+
+Returns `n -> Matrix{T}` of size `(N, n)`. `weights` must be non-negative and is
+normalised internally.
 """
 function sampler_from_weight_array(weights::Array{T, N}, distances::NTuple{N, T}) where {T, N}
-    w = Weights(weights[:])
-    ρ_p(N) = begin
-        idx = StatsBase.sample(1:length(weights), w, N)
-        s1, s2 = size(weights)
-        _p = Array{T, 2}(undef, 2, N)
-        @. _p[1, :] = ((idx - 1) % s1 + 1 + $rand(T, N)) * distances[1] - s1/2 * distances[1]
-        @. _p[2, :] = ((idx - 1) ÷ s1 + 1 + $rand(T, N)) * distances[2] - s2/2 * distances[2]
-        return _p
+    any(<(0), weights) && throw(ArgumentError("weights must be non-negative"))
+    dims = size(weights)
+    cells = CartesianIndices(dims)
+    table = StatsBase.AliasTable(vec(weights))
+    # Offset that puts the origin at the centre of the array.
+    origin = ntuple(i -> T(dims[i]) * distances[i] / 2, N)
+
+    ρ_p(n::Integer) = begin
+        idx = rand(table, n)
+        p = Array{T, 2}(undef, N, n)
+        @inbounds for j in 1:n
+            c = cells[idx[j]]
+            for i in 1:N
+                # c[i] - 1 is the cell's lower edge in cell units, + rand() picks a uniform point inside the cell.
+                p[i, j] = (c[i] - 1 + rand(T)) * distances[i] - origin[i]
+            end
+        end
+        return p
     end
-    return DirectSampler{T}(ρ_p)
+    return ρ_p
 end
 
 """
     gauss_profile_sampler(T, c, σ) 
-Instantiates `DirectSampler` object that generates position samples centered at `c` with a standard-deviation `σ`.
+Position sampler generating samples centered at `c` with a standard-deviation `σ`.
 """
 function gauss_profile_sampler(T, c, σ)
     c, σ = T.(c), T.(σ)
     @assert size(c, 1) == size(σ, 1)
     if typeof(σ) == Array{T, 2}
         @assert size(σ, 1) == size(σ, 2)
-        return DirectSampler{T}(N -> repeat(c, 1, N) .+ σ * randn(T, size(σ, 1), N))
+        return N -> repeat(c, 1, N) .+ σ * randn(T, size(σ, 1), N)
     elseif typeof(σ) == Vector{T}
-        return DirectSampler{T}(N -> repeat(c, 1, N) .+ repeat(σ, 1, N) .* randn(T, size(σ, 1), N))
+        return N -> repeat(c, 1, N) .+ repeat(σ, 1, N) .* randn(T, size(σ, 1), N)
     end
 end
 
@@ -56,7 +71,7 @@ function focused_beam_direction_sampler(T, grid_size, dist_focus)
         @. res[3, :] = cos(θ)
         return res
     end
-    return DirectSampler{T}(sampler)
+    return sampler
 end
 
 """
@@ -70,11 +85,11 @@ function create_xy_beam_sampler(T, grid_size, initial_spot_size, focus_dist)
     beam_profile = gauss_profile_sampler(T, [grid_size[1:2]...]./2, initial_spot_size)
     beam_direction = focused_beam_direction_sampler(T, grid_size, focus_dist)
     add_z_dim(x) = vcat(x, fill(0, (1, size(x, 2))))
-    return BeamSampler(beam_profile, beam_direction, add_z_dim)
+    return BeamSampler{T}(beam_profile, beam_direction, add_z_dim)
 end
 
 
-function normal_angle_sampler(T, σ_cone, tilt)::DirectSampler
+function normal_angle_sampler(T, σ_cone, tilt)::Function
 
     @inline function fun(p_membrane::Array{T, 2}) where {T}
         n_samples = size(p_membrane, 2)
@@ -101,9 +116,7 @@ function normal_angle_sampler(T, σ_cone, tilt)::DirectSampler
         return d
     end
 
-    sampler = DirectSampler{T}(fun)
-
-    return sampler
+    return fun
 
 end
 
@@ -147,8 +160,8 @@ function angle_sampler(p, mean_angle, Δθ)
     Δd[3, :] .= sin.(θ) .* sin.(ϕ)
 
     d = similar(Δd)
-    @. d[1, :] = sin(mean_angle) * Δd[2,:] + cos(mean_angle) * Δd[1, :]
-    @. d[2, :] = cos(mean_angle) * Δd[2,:] - sin(mean_angle) * Δd[1, :]
+    @. d[1, :] = cos(mean_angle) * Δd[1, :] - sin(mean_angle) * Δd[2, :]
+    @. d[2, :] = sin(mean_angle) * Δd[1, :] + cos(mean_angle) * Δd[2, :]
     @. d[3, :] = Δd[3, :]
     return d
 end
@@ -160,8 +173,8 @@ function initialize_beam_sampler(T, angle, beam_divergence, shift, illumination_
         return profile, res
     end
 
-    beam_sampler = BeamSampler(profile, (res, res), 
-                               DirectSampler{T}(p -> angle_sampler(p, angle, beam_divergence)),
+    beam_sampler = BeamSampler(profile, (res, res),
+                               p -> angle_sampler(p, angle, beam_divergence),
                                _p -> embed_and_shift(_p, shift))
     next(beam_sampler, 10)
     return beam_sampler

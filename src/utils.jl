@@ -1,53 +1,66 @@
 """
-    pad_array(A::Array)
-Add a single pixel at each boundary of `A`. Those added pixels are filled with the value of their interior neighbour.
+    @per_direction K T k -> expr
+
+Build the `SVector{K,T}` whose `k`-th entry is `expr`.
+
+The tangent state of the sensitivity computation is carried in registers as an
+`SVector{K}`, so every per-direction quantity has to be written as
+
+    SVector{K,T}(ntuple(k -> ..., Val(K)))
+
+The `Val(K)` is what unrolls the loop at compile time and keeps the vector out of
+global memory, so it cannot be dropped.
+
+The index is the parameter of passed lambda. Its body is evaluated inside
+`@inbounds`, since every caller here indexes with a loop variable that is
+`1:K` by construction.
+
+    dP += @per_direction K T k -> (dμ_a[k, n] + dμ_s[k, n]) / μ_e
 """
-function pad_array(A::Array)
-    A_padded = Array{eltype(A)}(undef, (size(A) .+ 2)...)
-
-    # Inner Volume
-    A_padded[2:(end-1), 2:(end-1), 2:(end-1)] .= A
-
-    # Faces
-    A_padded[1, 2:(end-1), 2:(end-1)] .= A[1, :, :]
-    A_padded[2:(end-1), 1, 2:(end-1)] .= A[:, 1, :]
-    A_padded[2:(end-1), 2:(end-1), 1] .= A[:, :, 1]
-    A_padded[end, 2:(end-1), 2:(end-1)] .= A[end, :, :]
-    A_padded[2:(end-1), end, 2:(end-1)] .= A[:, end, :]
-    A_padded[2:(end-1), 2:(end-1), end] .= A[:, :, end]
-
-    # Edges
-    A_padded[1, 1, 2:(end-1)] .= A[1,1,:]
-    A_padded[1, 2:(end-1), 1] .= A[1,:,1]
-    A_padded[2:(end-1), 1, 1] .= A[:,1,1]
-    A_padded[1, end, 2:(end-1)] .= A[1,end,:]
-    A_padded[1, 2:(end-1), end] .= A[1,:,end]
-    A_padded[end, 1, 2:(end-1)] .= A[end,1,:]
-    A_padded[end, 2:(end-1), 1] .= A[end,:,1]
-    A_padded[2:(end-1), 1, end] .= A[:,1,end]
-    A_padded[2:(end-1), end, 1] .= A[:,end,1]
-    A_padded[end, end, 2:(end-1)] .= A[end,end,:]
-    A_padded[end, 2:(end-1), end] .= A[end,:,end]
-    A_padded[2:(end-1), end, end] .= A[:,end,end]
-
-    # Corners
-    A_padded[1,1,1] = A[1,1,1]
-    A_padded[1,1,end] = A[1,1,end]
-    A_padded[1,end,1] = A[1,end,1]
-    A_padded[end,1,1] = A[end,1,1]
-    A_padded[1,end,end] = A[1,end,end]
-    A_padded[end,1,end] = A[end,1,end]
-    A_padded[end,end,1] = A[end,end,1]
-    A_padded[end,end,end] = A[end,end,end]
-
-    return A_padded
+macro per_direction(K, T, f)
+    (f isa Expr && f.head === :->) || throw(ArgumentError(
+        "@per_direction expects a `k -> expr` lambda as its third argument, got `$f`"))
+    index, body = f.args
+    checked = Expr(:->, index, Expr(:macrocall, Symbol("@inbounds"), __source__, body))
+    return :(SVector{$(esc(K)),$(esc(T))}(ntuple($(esc(checked)), Val($(esc(K))))))
 end
 
 """
-    unpad(x)
-Remove padding at boundary of `x`
+    normalize_directions(μ_a, dμ_a, dμ_s) -> (dμ_a, dμ_s, K, stacked)
+
+Canonicalise the sensitivity inputs to the `(K, size(μ_a)...)` layout the
+transport kernels expect.
+
+`dμ_a`/`dμ_s` may be `nothing` (no sensitivity, `K == 0`), a 3D array shaped like
+`μ_a` (one direction, reported back as 3D — `stacked == false`), or a 4D
+`(K, size(μ_a)...)` array. Pair with [`denormalize_directions`](@ref) on the way
+out.
+
+This is shared by every transport entry point so that what counts as a legal
+perturbation shape is defined once.
 """
-unpad(x) = Array(x)[2:(end-1), 2:(end-1), 2:(end-1)]
+function normalize_directions(μ_a, dμ_a, dμ_s)
+    xor(isnothing(dμ_a), isnothing(dμ_s)) &&
+        error("Either both or neither dμ_a and dμ_s can be nothing.")
+    isnothing(dμ_a) && return nothing, nothing, 0, false
+
+    @assert size(dμ_a) == size(dμ_s) "dμ_a and dμ_s must have the same shape"
+    @assert ndims(dμ_a) in (3, 4) "dμ_a must be 3D (one direction) or 4D (K, size(μ_a)...)"
+    @assert size(dμ_a)[end-2:end] == size(μ_a) "trailing dimensions of dμ_a must match size(μ_a)"
+
+    stacked = ndims(dμ_a) == 4
+    dμ_a = stacked ? dμ_a : reshape(dμ_a, 1, size(dμ_a)...)
+    dμ_s = stacked ? dμ_s : reshape(dμ_s, 1, size(dμ_s)...)
+    return dμ_a, dμ_s, size(dμ_a, 1), stacked
+end
+
+"""
+    denormalize_directions(dE, stacked)
+
+Undo [`normalize_directions`](@ref) on the result: a 3D perturbation went in, so
+a 3D derivative comes back out.
+"""
+denormalize_directions(dE, stacked) = stacked ? dE : dropdims(dE, dims=1)
 
 """
     cuda_params(N, n_threads, n_blocks)

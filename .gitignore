@@ -2,6 +2,7 @@ artifacts/
 
 Manifest.toml
 scripts/Manifest.toml
+LocalPreferences.toml
 
 *.png
 *.csv
@@ -10,3 +11,10 @@ scripts/Manifest.toml
 *.h5
 
 .vscode/
+
+test/validation/Manifest.toml
+test/validation/results/*
+test/validation/results/*.md
+test/validation/results/*.png
+test/validation/.venv/
+test/validation/uv.lock

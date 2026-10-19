@@ -1,10 +1,7 @@
 module Moca
 
 export
-    BeamLogDensity,
     BeamSampler,
-    GenericSampler,
-    DirectSampler,
     light_transport_gpu,
     gauss_profile_sampler,
     sampler_from_weight_array,
@@ -21,14 +18,13 @@ using CUDA
 using StaticArrays
 using HDF5
 
-using AdvancedHMC
-using Zygote
-using LogDensityProblems
 
-
-include("utils.jl")
-include("BeamSampling.jl")
-include("MonteCarlo.jl")
-include("sugar.jl")
+include("utils.jl")        # @per_direction, direction bookkeeping, launch config
+include("Layout.jl")       # voxel memory layout, padding, property packing
+include("BeamSampling.jl") # light source definition (CPU only)
+include("RaySupply.jl")    # staging rays onto the GPU and refilling them
+include("Transport.jl")    # the device kernel and the physics it runs
+include("MonteCarlo.jl")   # light_transport_gpu: setup, main loop, teardown
+include("sugar.jl")        # ready-made beam samplers
 
 end # module

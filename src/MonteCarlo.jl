@@ -1,14 +1,11 @@
 ################################################################################
-#Controll functions
+# Transport driver
 ################################################################################
+
 function light_transport_gpu(L₀::BeamSampler{T}, μ_a, μ_s, g, grid_size, simulation_bounds,
-                             N, iterations_bunch; n_threads=256, n_blocks=1024, max_loops=Inf, 
-                             term_threshold=1f-5) where T
-    dμ_a = nothing
-    dμ_s = nothing
-    return light_transport_gpu(L₀, μ_a, μ_s, dμ_a, dμ_s, g, grid_size, simulation_bounds, N, iterations_bunch;
-                               n_threads=n_threads, n_blocks=n_blocks, max_loops=max_loops, 
-                               term_threshold=term_threshold)
+                             N, iterations_bunch; kwargs...) where T
+    return light_transport_gpu(L₀, μ_a, μ_s, nothing, nothing, g, grid_size, simulation_bounds,
+                               N, iterations_bunch; kwargs...)
 end
 """
     light_transport_gpu(L₀::BeamSampler{T}, μ_a, μ_s, dμ_a, dμ_s, g, grid_size, simulation_bounds, N, iterations_bunch; n_threads, n_blocks, max_loops)
@@ -16,13 +13,20 @@ end
 Compute absorbed light in a 3D volume. The optical properties are specified by μ_a and μ_s, the illumination by L_0.
 If 'sensitivity=true', the derivative of the absorbed energy in the direction of (dμ_a, dμ_s) is also tracked. 
 The function returns the absorbed energy as a 3D array, as well as the derivative if it is computed.
+The derivative has the same rank as `dμ_a`: a 3D array for a single direction, or a 4D array
+`(K, size(μ_a)...)` when `K` directions are passed.
 
 # Arguments
 L₀                      Defines light source. Both spatial distribution of the intensity and distribution over movement-directions of the rays.
 μ_a                     3D array with absorption coefficients for each voxel
 μ_s                     3D array with scattering coefficients for each voxel
-dμ_a                    Infinitesimal change of absorption coefficients for sensitivity computation
-dμ_s                    Infinitesimal change of scattering coefficients for sensitivity computation
+dμ_a                    Infinitesimal change of absorption coefficients for sensitivity computation.
+                        Either a 3D array shaped like `μ_a` (a single derivative direction), or a 4D
+                        array `(K, size(μ_a)...)` holding `K` directions at once. The ray paths do not
+                        depend on the perturbation, so all `K` derivatives share one path ensemble and
+                        cost far less than `K` separate runs.
+dμ_s                    Infinitesimal change of scattering coefficients for sensitivity computation.
+                        Must have the same shape as `dμ_a`.
 g                       Scattering anisotropy coefficient, either a scalar or a 3D array with the same shape as μ_a and μ_s
 grid_size               Physical dimensions of the grid
 simulation_bounds       Corners of box, for which rays will be simulated. If a ray leaves the box, it will no longer be propagated.
@@ -32,6 +36,28 @@ n_threads               Number of CUDA threads
 n_blocks                Number of CUDA blocks
 max_loops               Maximum number of ray-propagation steps that will be performed. It it is exceeded,
                         the ray is terminated regardless of its state
+drain                   Finish the rays still in flight when the main loop exits, rather than
+                        abandoning them (default `true`). The loop stops the moment `N` rays have
+                        terminated, which leaves a whole batch mid-path; their deposits are in the
+                        tally but they were never counted in the denominator, so `E` came out high
+                        by ~`n_batch/N`. Draining costs one extra batch of rays -- at production
+                        ray counts a fraction of a percent of the run.
+max_drain_batches       Guard on the drain: at most this many kernel launches, each of
+                        `iterations_bunch` steps (default 10).
+acc                   Element type of the accumulator arrays `E` and `dE` (default `Float64`).
+verbose                 Print the run configuration and show a progress bar (default `true`).
+stats                   When `true`, append a `NamedTuple` of run statistics to the return
+                        value -- `(E, stats)` or `(E, dE, stats)`. It carries `n_rays`,
+                        `n_stranded` (how many rays the drain guard cut short), `n_steps`,
+                        `steps_per_ray`, `setup_time`, `transport_time`, `teardown_time`,
+                        `wall_time`, `rays_per_s` and `steps_per_s`. `steps_per_ray` is the
+                        key diagnostic when profiling: under delta tracking it is a property
+                        of the physics and must not change when only the voxel count does.
+block                   Edge length of the memory bricks the voxel arrays are stored in, one
+                        of $(SUPPORTED_BLOCKS) (default `1`). `1` is plain column-major
+                        storage. Larger values keep spatially neighbouring voxels close in
+                        memory, which helps only if L2 misses are what limits the run --
+                        see [`BrickLayout`](@ref) and `scripts/profile_grid.jl`.
 
 # Example
     μ_a = randn(100, 10, 100)
@@ -43,270 +69,169 @@ max_loops               Maximum number of ray-propagation steps that will be per
 
 """
 function light_transport_gpu(L₀::BeamSampler{T}, μ_a, μ_s, dμ_a, dμ_s, g, grid_size, simulation_bounds,
-                             N, iterations_bunch; n_threads=256, n_blocks=1024, max_loops=Inf, 
-                             term_threshold=1f-5) where T
+                             N, iterations_bunch;
+                             n_threads=256, n_blocks=1024, max_loops=Inf,
+                             term_threshold=1f-5, acc=Float64, verbose=true, stats=false,
+                             block=1, drain=true, max_drain_batches=10) where T
+    t_enter = time()
     @assert size(μ_a) == size(μ_s)
-    xor(isnothing(dμ_a), isnothing(dμ_s)) && error("Either both or neither dμ_a and dμ_s can be nothing.")
-    sensitivity = !(isnothing(dμ_a) && isnothing(dμ_s))
-    println("sensitivity=$(sensitivity)")
+    # `K` is the number of derivative directions carried simultaneously. It becomes a
+    # `Val` type parameter of the kernel so the per-direction loop unrolls and the tangent
+    # state stays in registers as an `SVector{K}` rather than spilling to global memory.
+    # A 3D `dμ_a` is the K == 1 case and is reported back as a 3D array.
+    dμ_a, dμ_s, K, stacked = normalize_directions(μ_a, dμ_a, dμ_s)
+    sensitivity = K > 0
 
     spatial_discretization = SA{T}[(grid_size ./ size(μ_a))...]
-    println("dspace = $(spatial_discretization)")
     simulation_bounds = Tuple(SA{T}[bounds...] for bounds in simulation_bounds)
-    println("sim bounds = $(simulation_bounds)")
     μ_max = T(maximum(μ_a .+ μ_s) * (sensitivity ? 1.2 : 1))
-    println("μ_max=$(μ_max) max(μ_a)=$(maximum(μ_a)) max(μ_s)=$(maximum(μ_s)) min(g)=$(minimum(g))")
     if isa(g, Number)
         g = fill(T(g), size(μ_a))
     end
     @assert maximum(abs.(g)) <= 1 "Anisotropy must be in the interval [-1, 1]"
     n_threads, n_blocks, n_batch = cuda_params(N, n_threads, n_blocks)
-    println("threads=$n_threads blocks=$n_blocks batches=$n_batch")
 
-    μ_a, μ_s, dμ_a, dμ_s, g = map(x -> isnothing(x) ? CUDA.zeros(T, 1) : CuArray{T}(pad_array(x)), (μ_a, μ_s, dμ_a, dμ_s, g))
-    E = CUDA.zeros(T, size(μ_a))
-    dE = sensitivity ? zero(E) : CUDA.zeros(T, 1)
+    if verbose
+        println("sensitivity=$(sensitivity) K=$(K)")
+        println("dspace = $(spatial_discretization)")
+        println("sim bounds = $(simulation_bounds)")
+        println("μ_max=$(μ_max) max(μ_a)=$(maximum(μ_a)) max(μ_s)=$(maximum(μ_s)) min(g)=$(minimum(g))")
+        println("threads=$n_threads blocks=$n_blocks batches=$n_batch")
+    end
 
-    CUDA.@sync p_samples, d_samples, R_samples, dR_samples, dP_samples = initialize_samples(L₀, n_batch)
+    # Every voxel-indexed array shares one layout, so a deposit lands in the same
+    # brick the properties were just read from. The layout addresses exactly the
+    # volume `pack_properties` produced, guard cells included -- it is told that
+    # extent rather than deriving it, so it cannot disagree with the padding.
+    props_host = pack_properties(T, μ_a, μ_s, g)
+    layout = brick_layout(block, size(props_host)[2:4])
+    props = CuArray{T}(brick_permute(props_host, layout))
+    dμ_a, dμ_s = map(x -> sensitivity ? CuArray{T}(brick_permute(pad_stack(x), layout)) :
+                                        CUDA.zeros(T, 1, 1),
+                     (dμ_a, dμ_s))
+    E = CUDA.zeros(acc, length(layout))
+    dE = sensitivity ? CUDA.zeros(acc, K, length(layout)) : CUDA.zeros(acc, 1, 1)
+
+    CUDA.@sync p_samples, d_samples, R_samples, dR_samples, dP_samples = initialize_samples(L₀, n_batch, K)
     terminate = CUDA.fill(false, n_batch)
+    refill_buf = RefillBuffers{T}(n_batch)
+    sample_pool = SamplePool{T}(n_batch)
 
-    p = Progress(N, dt=0.5, showspeed=true)
+    p = Progress(N, dt=0.5, showspeed=true, enabled=verbose)
     loops = 0
     n_finished_rays = 0
-    @inline callback!(Res, _ ,_, _, _, _, _, _, _, W, i, j, l) = (CUDA.@atomic Res[i, j, l] += W)
-    eval_cuda_kernel!(E, p_samples, d_samples, R_samples, terminate, dE, dR_samples, dP_samples) = @cuda threads = n_threads blocks = n_blocks monte_carlo_kernel!(
+    eval_cuda_kernel!() = @cuda threads = n_threads blocks = n_blocks monte_carlo_kernel!(
         E, p_samples, d_samples, R_samples, terminate,
-        μ_a, μ_s, g, μ_max,
+        props, μ_max,
         dE, dR_samples, dP_samples, dμ_a, dμ_s,
-        simulation_bounds, spatial_discretization,
+        simulation_bounds, spatial_discretization, layout,
         T(term_threshold),
-        iterations_bunch, callback!, sensitivity)
-    @info "Start propagating $N rays"
+        iterations_bunch, Val(K))
+
+    verbose && @info "Start propagating $N rays"
+    CUDA.synchronize()
+    t_start = time()
     while n_finished_rays < N && loops < max_loops
         Δt = @timed begin
-            eval_cuda_kernel!(E, p_samples, d_samples, R_samples, terminate, dE, dR_samples, dP_samples)
-            CUDA.@sync blocking=false begin 
-                p_samples, d_samples, R_samples, dR_samples, dP_samples = refill_samples!(
-                    L₀, p_samples, d_samples, R_samples, dR_samples, dP_samples, terminate)
+            eval_cuda_kernel!()
+            # `@cuda` returns as soon as the launch is queued, so this host work
+            # runs while the kernel is still executing.
+            topup!(sample_pool, L₀)
+            CUDA.@sync blocking=false begin
+                refill_samples!(L₀, p_samples, d_samples, R_samples,
+                                dR_samples, dP_samples, terminate, refill_buf, sample_pool)
             end 
         end
-        n_finished_rays += sum(terminate)
+        # `@timed` carries the block's value through: `refill_samples!` returns the
+        # number of slots that terminated, counted on the host while scanning the
+        # bitmask, so this avoids a device reduction plus a sync each iteration.
+        n_terminated = Δt.value
+        n_finished_rays += n_terminated
         loops += n_threads * n_blocks * iterations_bunch
-        update!(p, n_finished_rays, 
-                showvalues=[(Symbol("Rays/s"), sum(terminate)/Δt.time), 
-                            (Symbol("Energy"), "$(100*sum(E)/n_finished_rays)%")])
-        terminate = CUDA.fill(false, n_batch)
+        update!(p, n_finished_rays,
+                showvalues = () -> [(Symbol("Rays/s"), n_terminated / Δt.time),
+                                    (Symbol("Energy"), "$(100 * sum(E) / n_finished_rays)%")])
+        fill!(terminate, false)
     end
+    CUDA.synchronize()
+
+    n_stranded = 0
+    if drain
+        n_drained, n_stranded, residual, drain_batches =
+            drain_in_flight!(eval_cuda_kernel!, terminate, R_samples, refill_buf.terminate;
+                             max_batches = max_drain_batches,
+                             progress_cb = (n_alive, _) -> update!(p, n_finished_rays,
+                                 showvalues = () -> [(Symbol("Draining"), "$n_alive rays in flight")]))
+        n_finished_rays += n_drained + n_stranded
+        loops += drain_batches * n_threads * n_blocks * iterations_bunch
+        verbose && finish!(p)
+        if n_stranded > 0
+            # `residual` and `sum(E)` are both unnormalised weight, so their ratio
+            # bounds the fraction of the tally the truncation cost -- bounds rather
+            # than equals, since some of that weight would have escaped the box
+            # rather than being deposited.
+            lost = 100 * residual / max(sum(E), eps(Float64))
+            @warn("$n_stranded rays hit the drain guard and were cut short; they still " *
+                  "carried up to $(round(lost, digits=4))% of the tallied energy. Raise " *
+                  "`max_drain_batches` if that is too much.")
+        end
+    end
+    transport_time = time() - t_start
 
     loops >= max_loops && @warn "Some rays were terminated as they exceeded the `max_loops` threshold"
-    n_finished_rays += sum(terminate)
-    println("\n\n")
-    @info("Total energy: $(100*sum(E)/n_finished_rays)%")
-    E = unpad(E)./n_finished_rays
+    if verbose
+        println("\n\n")
+        @info("Total energy: $(100*sum(E)/n_finished_rays)%")
+    end
+
+    t_teardown_start = time()
+    E_out = unbrick_unpad(E, layout, size(μ_a)) ./ n_finished_rays
+    dE_out = sensitivity ?
+        denormalize_directions(unbrick_unpad(dE, layout, size(μ_a)) ./ n_finished_rays,
+                               stacked) : nothing
+    run_stats = (n_rays = n_finished_rays,
+                 n_stranded = n_stranded,
+                 block = blocksize(layout),
+                 overhang = overhang(layout),
+                 n_steps = loops,
+                 steps_per_ray = loops / max(n_finished_rays, 1),
+                 setup_time = t_start - t_enter,
+                 transport_time = transport_time,
+                 teardown_time = time() - t_teardown_start,
+                 wall_time = time() - t_enter,
+                 rays_per_s = n_finished_rays / transport_time,
+                 steps_per_s = loops / transport_time)
+
     if sensitivity
-        return E, unpad(dE) ./ n_finished_rays
+        return stats ? (E_out, dE_out, run_stats) : (E_out, dE_out)
     else
-        return E
+        return stats ? (E_out, run_stats) : E_out
     end
 end
 
-"""
-    initialize_samples(beam_sampler, n_samples) 
-Draw positions, directions and energies for `n_samples` rays and initialize the differential parameters
-"""
-function initialize_samples(beam_sampler, n_samples)
-    p_samples, d_samples, R_samples = next(beam_sampler, n_samples)
-    T = typeof(beam_sampler).parameters[1]
-    return map(CuArray, (p_samples, d_samples, R_samples, zeros(T, n_samples), zeros(T, n_samples)))
-end
 
+function drain_in_flight!(eval_kernel!, terminate, R_samples, host_terminate;
+                          max_batches::Integer,
+                          progress_cb = (n_alive, batches) -> nothing)
+    n_batch = length(host_terminate)
+    n_alive = n_batch
+    batches = 0
 
-"""
-    refill_samples!(beam_sampler::BeamSampler{T}, p, d, R, dR, dP, terminate)
-If an entry in `terminate` is true, replace the corresponding entries in
-`p`, `d` with a new sample and reset `R`, `dR`, `dP` to zero.
-"""
-function refill_samples!(beam_sampler::BeamSampler{T}, p, d, R, dR, dP, terminate) where T
-    p_CPU, d_CPU, R_CPU, dR_CPU, dP_CPU, terminate_CPU = map(Array, (p, d, R, dR, dP, terminate))
-    # sum up terminated energy as consistency check
-
-    n_new_samples = Int(sum(terminate_CPU))
-    # @assert n_new_samples > 0 "n_new_samples = $(n_new_samples)"
-    new_p, new_d, new_R = next(beam_sampler, n_new_samples)
-
-    p_CPU[:, terminate_CPU] .= new_p
-    d_CPU[:, terminate_CPU] .= new_d
-    R_CPU[terminate_CPU] .= new_R
-    dR_CPU[terminate_CPU] .= zero(T)
-    dP_CPU[terminate_CPU] .= zero(T)
-
-    return map(CuArray, (p_CPU, d_CPU, R_CPU, dR_CPU, dP_CPU))
-end
-
-
-function split_samples!(p, d, R, dR, dP, terminate)
-    p_CPU, d_CPU, R_CPU, dR_CPU, dP_CPU, terminate_CPU = map(Array, (p, d, R, dR, dP, terminate))
-
-    terminate_idx = findall(terminate_CPU)
-    continue_idx = findall(!, terminate_CPU)
-    for i = 1:min(length(terminate_idx), length(continue_idx))
-        p_CPU[:, terminate_idx[i]] .= p_CPU[:, continue_idx[i]]
-        d_CPU[:, terminate_idx[i]] .= d_CPU[:, continue_idx[i]]
-        R_CPU[terminate_idx[i]] = R_CPU[continue_idx[i]]/2
-        dR_CPU[terminate_idx[i]] = dR_CPU[continue_idx[i]]/2
-        dP_CPU[terminate_idx[i]] = dP_CPU[continue_idx[i]]
-        terminate_CPU[terminate_idx[i]] = false
-
-        R_CPU[continue_idx[i]] = R_CPU[continue_idx[i]]/2
-        dR_CPU[continue_idx[i]] = dR_CPU[continue_idx[i]]/2
+    while n_alive > 0 && batches < max_batches
+        eval_kernel!()
+        # Counting terminate on the host gives the synchronisation the loop needs
+        copyto!(host_terminate, terminate)
+        n_alive = n_batch - count(host_terminate)
+        batches += 1
+        progress_cb(n_alive, batches)
     end
 
-    return map(CuArray, (p_CPU, d_CPU, R_CPU, dR_CPU, dP_CPU, terminate_CPU))
-end
-
-
-"""
-    monte_carlo_kernel!(E, p_samples, d_samples, R_samples, terminate, μ_a, μ_s, g, μ_max, dE, dR_samples, dP_samples, dμ_a, dμ_s, simulation_bounds, spatial_discretication, min_R, propagate_batch, callback!, sensitivity)
-CUDA kernel that takes the position and direction arguments of a sample and updates them with `propagate_ray!`.
-After `propagate_batch` iterations, `terminate_ray` is called to check whether the ray will continue to the next call of `monte_carlo_kernel!` or not.
-"""
-function monte_carlo_kernel!(E, p_samples, d_samples, R_samples, terminate,
-    μ_a, μ_s, g, μ_max,
-    dE, dR_samples, dP_samples, dμ_a, dμ_s,
-    simulation_bounds, spatial_discretication,
-    min_R, propagate_batch, callback!, sensitivity)
-
-    idx = threadIdx().x + (blockIdx().x - 1) * blockDim().x
-    p₁, p₂, p₃ = p_samples[1, idx], p_samples[2, idx], p_samples[3, idx]
-    d₁, d₂, d₃ = d_samples[1, idx], d_samples[2, idx], d_samples[3, idx]
-    R = R_samples[idx]
-    dR = dR_samples[idx]
-    dP = dP_samples[idx]
-
-    for _ = 1:propagate_batch
-        p₁, p₂, p₃, d₁, d₂, d₃, R, dR, dP = propagate_ray!(
-            E, p₁, p₂, p₃, d₁, d₂, d₃,
-            R, μ_a, μ_s, μ_max, g,
-            dE, dR, dP, dμ_a, dμ_s,
-            spatial_discretication, callback!, sensitivity)
-    end
-
-    R += (R<min_R && rand()<0.01) * (R * 99)
-
-    terminate[idx] = terminate_ray(p₁, p₂, p₃, R, min_R, simulation_bounds)
-
-    p_samples[1, idx], p_samples[2, idx], p_samples[3, idx] = p₁, p₂, p₃
-    d_samples[1, idx], d_samples[2, idx], d_samples[3, idx] = d₁, d₂, d₃
-    R_samples[idx] = R
-    dR_samples[idx] = dR
-    dP_samples[idx] = dP
-
-    return nothing
-end
-
-"""
-    terminate_ray(p1, p2, p3, R, R_threshold, bound)
-Checks, whether the coordinates `[p1, p2, p3]` are inside of the simulations bounds set by `bounds`
-and if the energy of the ray is higher than `R_threshold`
-"""
-function terminate_ray(p1, p2, p3, R, R_threshold, bound)
-    return (R < R_threshold ||
-            p1 < bound[1][1] || p2 < bound[1][2] || p3 < bound[1][3] ||
-            p1 > bound[2][1] || p2 > bound[2][2] || p3 > bound[2][3])
-end
-
-
-################################################################################
-#Move and Scattering
-################################################################################
-"""
-    propagate_ray!(Res, p₁::T, p₂::T, p₃::T, d₁::T, d₂::T, d₃::T, R::T, μ_a, μ_s, μ_max::T, g, dRes, dR::T, dP::T, dμ_a, dμ_s, spatial_discretication, callback!, sensitivity)
-Low-level function to perform a single update on the position and direction of a ray.
-
-First, a step length is drawn with a mean free path length of `1/μ_max` and the
-ray is propagated that distance in the direction of `[d₁, d₂, d₃]`. The total
-interaction coefficient at the new coordinates is then used to sample interaction
-and null events. If an interaction occurs, a fraction `μ_a/(μ_a + μ_s)` of the
-energy `R` is absorbed and a new propagation direction is sampled. If 
-`sensitivity == true`, the sensitivity of the result w.r.t changes `dμ_a`, `dμ_s`
-is also computed. 
-
-The `callback!` function is used to track the quantity of interest.
-The passed arguments are result-array, the three position and three direction variables,
-the step size, change in energy and array-index of the ray position.
-"""
-function propagate_ray!(Res, p₁::T, p₂::T, p₃::T, d₁::T, d₂::T, d₃::T, R::T,
-                        μ_a, μ_s, μ_max::T, g,
-                        dRes, dR::T, dP::T, dμ_a, dμ_s,
-                        spatial_discretication, callback!, sensitivity) where T
-
-    Δp = -log(clamp(rand(T), eps(T), one(T))) / μ_max
-    p₁ = p₁ + d₁ * Δp
-    p₂ = p₂ + d₂ * Δp
-    p₃ = p₃ + d₃ * Δp
-
-    i = clamp(unsafe_trunc(Int, p₁/spatial_discretication[1] + 1), 0, size(Res, 1) - 1) + 1 
-    j = clamp(unsafe_trunc(Int, p₂/spatial_discretication[2] + 1), 0, size(Res, 2) - 1) + 1
-    l = clamp(unsafe_trunc(Int, p₃/spatial_discretication[3] + 1), 0, size(Res, 3) - 1) + 1
-
-    μ_a_p = μ_a[i, j, l]
-    μ_s_p = μ_s[i, j, l]
-    g_p = g[i, j, l]
-    μ_e = μ_a_p + μ_s_p
-
-    if sensitivity
-        dμ_a_p = dμ_a[i, j, l]
-        dμ_s_p = dμ_s[i, j, l]
-    end
-
-    if rand(T) < μ_e/μ_max
-        d₁, d₂, d₃ = scatter(d₁, d₂, d₃, g_p)
-        W = R * μ_a_p / μ_e
-
-        if sensitivity
-            dP += (dμ_a_p + dμ_s_p) / μ_e
-            
-            dW = R * (μ_s_p * dμ_a_p - μ_a_p * dμ_s_p) / μ_e^2  + dR*μ_a_p/μ_e
-            dE = W * dP + dW
-            dR -= dW
-            callback!(dRes, p₁, p₂, p₃, d₁, d₂, d₃, R, Δp, dE, i, j, l)
+    residual = zero(eltype(R_samples))
+    if n_alive > 0
+        R_host = Array(R_samples)
+        @inbounds for i in eachindex(host_terminate)
+            host_terminate[i] || (residual += R_host[i])
         end
-
-        R -= W
-        callback!(Res, p₁, p₂, p₃, d₁, d₂, d₃, R, Δp, W, i, j, l)
-    elseif sensitivity
-        dP -= (dμ_a_p + dμ_s_p) / (μ_max - μ_e)
     end
-    return p₁, p₂, p₃, d₁, d₂, d₃, R, dR, dP
-end
-
-"""
-    scatter(d₁::T, d₂::T, d₃::T, g::T)
-Samples Henyey-Greenstein scattering function with anisotropy `g` for a new ray-direction given the current direction `[d₁, d₂, d₃]`.
-
-!!! note
-    The case `d₃ ≈ 1` is handled separately (without branching), as the generic sampling function has a singularity in this case.
-"""
-function scatter(d₁::T, d₂::T, d₃::T, g::T) where T
-    d₁′, d₂′, d₃′ = zero(d₁), zero(d₂), zero(d₃)
-
-    if isapprox(g, one(T))
-        cosθ = 1f0
-    elseif isapprox(g, zero(T))
-        cosθ = 2*rand(T) - 1
-    else
-        cosθ = (1 + g^2 - ((1 - g^2) / (1 - g + 2 * g * rand(T)))^2) / (2 * g)
-    end
-    sinθ = sqrt(clamp(1 - cosθ^2, zero(T), one(T)))
-    sinϕ, cosϕ = sincospi(2 * rand(T))
-
-    in_axis = isapprox(abs(d₃), 1)
-    sqrt1mdz = sqrt(1 - !in_axis * d₃^2)
-
-    d₁′ = in_axis * sinθ * cosϕ + !in_axis * (sinθ * (d₁ * d₃ * cosϕ - d₂ * sinϕ) / sqrt1mdz + d₁ * cosθ)
-    d₂′ = in_axis * sinθ * sinϕ + !in_axis * (sinθ * (d₂ * d₃ * cosϕ + d₁ * sinϕ) / sqrt1mdz + d₂ * cosθ)
-    d₃′ = in_axis * cosθ        + !in_axis * (-sinθ * cosϕ * sqrt1mdz + d₃ * cosθ)
-    
-    d_inv_norm = 1/sqrt(d₁′^2 + d₂′^2 + d₃′^2 + eps(T))
-    return d₁′*d_inv_norm, d₂′*d_inv_norm, d₃′*d_inv_norm
+    return n_batch - n_alive, n_alive, residual, batches
 end

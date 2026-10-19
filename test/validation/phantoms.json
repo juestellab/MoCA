@@ -1,0 +1,47 @@
+{
+  "cases": [
+    {
+      "name": "C1_infinite_g09",
+      "description": "Homogeneous 100 mm cube, isotropic point source at the centre, forward-peaked (g=0.9)",
+      "dim": [200, 200, 200],
+      "voxel_mm": 0.5,
+      "shell_voxels": 0,
+      "layers": [
+        {"z_from": 0, "z_to": 200, "mua": 0.01, "mus": 10.0, "g": 0.9}
+      ],
+      "source": {"type": "isotropic", "pos_mm": [50.0, 50.0, 50.0], "dir": [0.0, 0.0, 1.0]},
+      "pad_mm": 0.0,
+      "bunch": 2000,
+      "compare": {"mode": "radius", "center_mm": [50.0, 50.0, 50.0], "max_mm": 25.0}
+    },
+    {
+      "name": "C3_semiinf",
+      "description": "Semi-infinite slab, pencil beam at the surface, MCX cube60 properties at n=1",
+      "dim": [64, 64, 72],
+      "voxel_mm": 1.0,
+      "shell_voxels": 2,
+      "layers": [
+        {"z_from": 0, "z_to": 72, "mua": 0.005, "mus": 1.0, "g": 0.01}
+      ],
+      "source": {"type": "pencil", "pos_mm": [32.0, 32.0, 2.0], "dir": [0.0, 0.0, 1.0]},
+      "pad_mm": 0.0,
+      "bunch": 800,
+      "compare": {"mode": "label"}
+    },
+    {
+      "name": "C4_twolayer",
+      "description": "Two-layer slab: 10 mm of (0.02, 9.0, 0.9) over (0.005, 1.0, 0.01)",
+      "dim": [64, 64, 72],
+      "voxel_mm": 1.0,
+      "shell_voxels": 2,
+      "layers": [
+        {"z_from": 0, "z_to": 12, "mua": 0.02, "mus": 9.0, "g": 0.9},
+        {"z_from": 12, "z_to": 72, "mua": 0.005, "mus": 1.0, "g": 0.01}
+      ],
+      "source": {"type": "pencil", "pos_mm": [32.0, 32.0, 2.0], "dir": [0.0, 0.0, 1.0]},
+      "pad_mm": 0.0,
+      "bunch": 1600,
+      "compare": {"mode": "label"}
+    }
+  ]
+}

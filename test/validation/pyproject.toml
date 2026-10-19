@@ -1,0 +1,10 @@
+[project]
+name = "moca-validation"
+version = "0.1.0"
+description = "MCX reference runs for cross-validating Moca"
+requires-python = ">=3.12"
+dependencies = [
+    "pmcx>=0.7.1",
+    "numpy>=1.26",
+    "h5py>=3.10",
+]
